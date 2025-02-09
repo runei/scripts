@@ -1,0 +1,8 @@
+{
+  "name": "Python Development Environment",
+  "dockerComposeFile": "docker-compose.yaml",
+  "service": "python",
+  "workspaceFolder": "/scripts",
+  "customizations": {},
+  "remoteUser": "root"
+}

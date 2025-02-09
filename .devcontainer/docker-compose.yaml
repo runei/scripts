@@ -1,0 +1,11 @@
+services:
+  python:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: python-container
+    volumes:
+      - ./_bash_history:/root/.bash_history
+      - ../../scripts:/scripts
+    tty: true
+    stdin_open: true
