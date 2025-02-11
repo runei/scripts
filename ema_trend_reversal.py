@@ -1,16 +1,22 @@
-#!/usr/bin/env python3
-import os
-import time
-import hashlib
-import pandas as pd
-import numpy as np
-import vectorbt as vbt
-import yfinance as yf
-from datetime import datetime
+#!/venv/bin/python
+"""
+This script downloads historical stock data, processes trading signals based on technical analysis,
+and evaluates a trading strategy using the vectorbt library.
+"""
+
 import concurrent.futures
 import logging
-import requests
+import os
+import time
+from datetime import datetime
 from random import uniform
+
+import numpy as np
+import pandas as pd
+import requests
+import vectorbt as vbt
+import yfinance as yf
+from requests.exceptions import RequestException
 
 # -----------------------------
 # Configuration
@@ -23,15 +29,17 @@ EMA_DAILY = 50
 
 # Set this flag to True to download all tickers at once; set to False to use individual cached files.
 DOWNLOAD_NEW_DATA = False
-CSV_NAME = "mega.csv"
+CSV_NAME = (
+    "mega.csv"  # Downloaded from https://www.nasdaq.com/market-activity/stocks/screener
+)
 CACHE_DIR = "cache"
 START_DATE = "2015-01-01"
 END_DATE = datetime.today().strftime("%Y-%m-%d")
 
-MAX_RETRIES = 3  # Maximum retries for failed downloads
-REQUEST_DELAY = 1.5  # Seconds between requests
-BATCH_SIZE = 10  # Number of tickers per download batch
-CACHE_EXPIRATION_DAYS = 7  # Refresh cached data weekly
+MAX_RETRIES = 3
+REQUEST_DELAY = 1.5
+BATCH_SIZE = 10
+CACHE_EXPIRATION_DAYS = 7
 
 
 # -----------------------------
@@ -59,7 +67,15 @@ tickers = [
 # Helper: Flatten columns if necessary
 # -----------------------------
 def flatten_columns(df):
-    # Check if columns are a MultiIndex or tuple-based; if so, flatten them.
+    """
+    Flatten the columns of a DataFrame if they are a MultiIndex or tuple-based.
+
+    Parameters:
+        df (pd.DataFrame): The DataFrame whose columns may be a MultiIndex or contain tuples.
+
+    Returns:
+        pd.DataFrame: The DataFrame with flattened column names.
+    """
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = ["_".join(map(str, col)).strip() for col in df.columns.values]
     elif isinstance(df.columns[0], tuple):
@@ -71,10 +87,26 @@ def flatten_columns(df):
 # Modified Download Functions with Throttling and Retry
 # -----------------------------
 def download_data_with_retry(tickers, interval, session, start, end, retries=0):
-    """Download data with retries and throttling"""
+    """
+    Download data for a list of tickers with retries and throttling.
+
+    Parameters:
+        tickers (list): List of ticker symbols.
+        interval (str): Data interval (e.g., '1d', '1wk').
+        session (requests.Session): The session object to use for downloading.
+        start (str): Start date for data.
+        end (str): End date for data.
+        retries (int): Current number of retries.
+
+    Returns:
+        pd.DataFrame: DataFrame containing the downloaded data.
+    """
     try:
         logger.info(
-            f"Downloading {len(tickers)} {interval} tickers (attempt {retries + 1})"
+            "Downloading %s %s tickers (attempt %d)",
+            len(tickers),
+            interval,
+            retries + 1,
         )
         df = yf.download(
             tickers,
@@ -87,24 +119,34 @@ def download_data_with_retry(tickers, interval, session, start, end, retries=0):
         )
         time.sleep(uniform(REQUEST_DELAY, REQUEST_DELAY * 2))  # Randomized delay
         return df
-    except Exception as e:
+    except (RequestException, ValueError) as e:
         if retries < MAX_RETRIES:
             wait_time = REQUEST_DELAY * (2**retries)
-            logger.warning(f"Retrying in {wait_time}s... ({str(e)})")
+            logger.warning("Retrying in %s s... (%s)", wait_time, e)
             time.sleep(wait_time)
             return download_data_with_retry(
                 tickers, interval, session, start, end, retries + 1
             )
         else:
-            logger.error(f"Failed after {MAX_RETRIES} attempts: {str(e)}")
+            logger.error("Failed after %d attempts: %s", MAX_RETRIES, e)
             return pd.DataFrame()
 
 
 def download_data_all(interval, session, tickers, start=START_DATE, end=END_DATE):
-    """Download data in batches with rate limiting"""
-    # Create a reproducible filename based on the sorted ticker list and interval.
+    """
+    Download data for all tickers in batches with rate limiting, using caching.
 
-    filename = os.path.join(CACHE_DIR, f"{interval}.csv")
+    Parameters:
+        interval (str): Data interval (e.g., '1d', '1wk').
+        session (requests.Session): The session object to use for downloading.
+        tickers (list): List of ticker symbols.
+        start (str): Start date for data.
+        end (str): End date for data.
+
+    Returns:
+        pd.DataFrame: Combined DataFrame of all downloaded data.
+    """
+    filename = os.path.join(CACHE_DIR, "%s.csv" % interval)
 
     # Check if cached data is still valid
     if os.path.exists(filename):
@@ -112,14 +154,14 @@ def download_data_all(interval, session, tickers, start=START_DATE, end=END_DATE
             datetime.now() - datetime.fromtimestamp(os.path.getmtime(filename))
         ).days
         if file_age < CACHE_EXPIRATION_DAYS:
-            logger.info(f"Using cached {interval} data (age: {file_age} days)")
+            logger.info("Using cached %s data (age: %s days)", interval, file_age)
             df = pd.read_csv(filename, index_col="Date", parse_dates=True)
             return flatten_columns(df)
     # Split tickers into batches
     batches = [tickers[i : i + BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
     all_data = []
     for batch in batches:
-        logger.info(f"Processing batch of {len(batch)} tickers")
+        logger.info("Processing batch of %s tickers", len(batch))
         batch_data = download_data_with_retry(batch, interval, session, start, end)
         if not batch_data.empty:
             batch_data = flatten_columns(batch_data)
@@ -143,7 +185,9 @@ if DOWNLOAD_NEW_DATA:
     # Set custom headers to mimic a browser
     session.headers.update(
         {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/58.0.3029.110 Safari/537.3",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.5",
         }
@@ -161,31 +205,31 @@ else:
 
     # Load daily data from cache
     daily_all = pd.read_csv(
-        os.path.join(CACHE_DIR, f"1d.csv"), index_col="Date", parse_dates=True
+        os.path.join(CACHE_DIR, "1d.csv"), index_col="Date", parse_dates=True
     )
 
     # Load weekly data from cache
     weekly_all = pd.read_csv(
-        os.path.join(CACHE_DIR, f"1wk.csv"), index_col="Date", parse_dates=True
+        os.path.join(CACHE_DIR, "1wk.csv"), index_col="Date", parse_dates=True
     )
 
 for ticker in tickers:
-    daily_cols = [col for col in daily_all.columns if col.startswith(f"{ticker}_")]
+    daily_cols = [col for col in daily_all.columns if col.startswith("%s_" % ticker)]
     if daily_cols:
         daily_data_dict[ticker] = daily_all[daily_cols].rename(
-            columns=lambda x: x.replace(f"{ticker}_", "")
+            columns=lambda x: x.replace("%s_" % ticker, "")
         )
 
-    weekly_cols = [col for col in weekly_all.columns if col.startswith(f"{ticker}_")]
+    weekly_cols = [col for col in weekly_all.columns if col.startswith("%s_" % ticker)]
     if weekly_cols:
         weekly_data_dict[ticker] = weekly_all[weekly_cols].rename(
-            columns=lambda x: x.replace(f"{ticker}_", "")
+            columns=lambda x: x.replace("%s_" % ticker, "")
         )
 
 # Validate data existence
 missing_tickers = [t for t in tickers if t not in daily_data_dict]
 if missing_tickers:
-    logger.warning(f"Missing data for tickers: {missing_tickers}")
+    logger.warning("Missing data for tickers: %s", missing_tickers)
 
 # -----------------------------
 # Prepare Global DataFrames for Signals
@@ -200,10 +244,24 @@ sizes = pd.DataFrame(0.0, index=date_index, columns=tickers)
 # Process a Single Ticker
 # -----------------------------
 def process_ticker(ticker):
-    logger.info(f"Processing {ticker}...")
+    """
+    Process a single ticker to generate trading signals and position sizes.
+
+    This function computes EMAs from weekly and daily data, identifies entry and exit signals
+    based on technical criteria, and calculates the position sizes.
+
+    Parameters:
+        ticker (str): The ticker symbol to process.
+
+    Returns:
+        tuple: A tuple of three elements (ticker_entries, ticker_exits, ticker_sizes), each being a
+        pandas Series corresponding to the trading entries, exits, and sizes respectively.
+        If processing fails or data is unavailable, returns (None, None, None).
+    """
+    logger.info("Processing %s...", ticker)
     try:
         if ticker not in daily_data_dict or ticker not in weekly_data_dict:
-            logger.warning(f"No data available for {ticker}")
+            logger.warning("No data available for %s", ticker)
             return None, None, None
 
         daily = daily_data_dict.get(ticker, pd.DataFrame())
@@ -247,7 +305,6 @@ def process_ticker(ticker):
             ema50 = aligned_data["ema50_weekly"].iloc[i]
             close = aligned_data["Close"].iloc[i]
             low = aligned_data["Low"].iloc[i]
-            high = aligned_data["High"].iloc[i]
             prev_low = aligned_data["Low"].iloc[i - 1]
             prev_high = aligned_data["High"].iloc[i - 1]
 
@@ -289,8 +346,8 @@ def process_ticker(ticker):
 
         return ticker_entries, ticker_exits, ticker_sizes
 
-    except Exception as e:
-        logger.error(f"Error processing {ticker}: {e}")
+    except (KeyError, IndexError, ValueError) as e:
+        logger.error("Error processing %s: %s", ticker, e)
         return None, None, None
 
 
@@ -308,8 +365,8 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             t_entries, t_exits, t_sizes = future.result()
             if t_entries is not None:
                 results[ticker] = (t_entries, t_exits, t_sizes)
-        except Exception as exc:
-            logger.error(f"{ticker} generated an exception: {exc}")
+        except (KeyError, IndexError, ValueError, RequestException) as exc:
+            logger.error("%s generated an exception: %s", ticker, exc)
 
 for ticker, (t_entries, t_exits, t_sizes) in results.items():
     entries[ticker] = t_entries
@@ -341,16 +398,99 @@ pf = vbt.Portfolio.from_signals(
     upon_opposite_entry="close",
 )
 
+
 # -----------------------------
-# Output Performance Results
+# Enhanced Performance Evaluation
 # -----------------------------
-total_return = float(pf.total_return().mean() * 100)
-sharpe_ratio = float(pf.sharpe_ratio().mean())
-max_drawdown = float(pf.max_drawdown().mean() * 100)
-logger.info(f"Total Return: {total_return:.2f}%")
-logger.info(f"Sharpe Ratio: {sharpe_ratio:.2f}")
-logger.info(f"Max Drawdown: {max_drawdown:.2f}%")
-# pf.plot().show()
+def evaluate_strategy(pf, benchmark_ticker="SPY"):
+    """
+    Evaluate the performance of a trading strategy using portfolio statistics and benchmark comparison.
+
+    Parameters:
+        pf (vbt.Portfolio): The portfolio object containing trading signals and performance data.
+        benchmark_ticker (str): The ticker symbol for the benchmark (default is 'SPY').
+
+    Returns:
+        dict: A dictionary containing evaluation metrics including total return, annualized return,
+        benchmark return, max drawdown, volatility, total trades, win rate, profit factor, and average
+        winning/losing trade percentages.
+    """
+    # Get portfolio statistics (aggregated over all columns/tickers)
+    port_stats = pf.stats()
+    trade_stats = pf.trades.stats()
+
+    # Calculate returns and benchmark metrics
+    returns = pf.returns()
+    benchmark = yf.download(benchmark_ticker, start=START_DATE, end=END_DATE)["Close"]
+    benchmark_rets = benchmark.pct_change().dropna()
+
+    total_return = pf.total_return().mean() * 100
+    annualized_return = (
+        (pf.annualized_return().mean() * 100)
+        if not pf.trades.records_readable.empty
+        else 0
+    )
+    max_dd = pf.max_drawdown().mean() * 100
+
+    # Use positional indexing with .iloc to get the first and last values of the benchmark series
+    bench_return = (
+        (benchmark.iloc[-1] / benchmark.iloc[0] - 1) * 100 if len(benchmark) > 0 else 0
+    )
+    bench_vol = (
+        benchmark_rets.std() * (252**0.5) * 100 if len(benchmark_rets) > 0 else 0
+    )
+
+    trades = pf.trades.records_readable
+    win_rate = (trades["Status"] == "Win").mean() * 100 if not trades.empty else 0
+
+    evaluation = {
+        # Returns
+        "Total Return (%)": round(total_return, 2),
+        "Annualized Return (%)": round(annualized_return, 2),
+        "Benchmark Return (%)": round(bench_return, 2),
+        # Risk
+        "Max Drawdown (%)": round(max_dd, 2),
+        "Benchmark Volatility (%)": round(bench_vol, 2),
+        # Trade statistics
+        "Total Trades": len(trades),
+        "Win Rate (%)": round(win_rate, 2),
+        "Profit Factor": (
+            round(trade_stats.get("Profit Factor", np.nan), 2)
+            if not trade_stats.empty
+            else np.nan
+        ),
+        "Avg Win Trade (%)": (
+            round(trade_stats.get("Avg Winning Trade [%]", np.nan), 2)
+            if not trade_stats.empty
+            else np.nan
+        ),
+        "Avg Loss Trade (%)": (
+            round(trade_stats.get("Avg Losing Trade [%]", np.nan), 2)
+            if not trade_stats.empty
+            else np.nan
+        ),
+    }
+
+    # Print metrics using lazy formatting
+    logger.info("\nStrategy Evaluation:")
+    for metric, value in evaluation.items():
+        logger.info("%s %s", metric.ljust(30, "."), value)
+
+    # Plotting (only if there are trades)
+    if not pf.trades.records_readable.empty:
+        fig = pf.plot(
+            subplots=[
+                ("cum_returns", {"title": "Cumulative Returns"}),
+                ("drawdowns", {"title": "Drawdowns"}),
+            ]
+        )
+        fig.show()
+
+    return evaluation
+
+
+# Run evaluation
+strategy_eval = evaluate_strategy(pf)
 
 # -----------------------------
 # Save Trades to CSV
