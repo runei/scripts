@@ -48,6 +48,7 @@ daily_data_dict = {}
 weekly_data_dict = {}
 date_index = None
 tickers = []
+logger = logging.getLogger(__name__)
 
 
 # -----------------------------
@@ -282,65 +283,65 @@ def evaluate_strategy(portfolio, benchmark_ticker="SPY"):
     """
     Evaluate the performance of a trading strategy.
     """
-    trade_stats = portfolio.trades.stats()
-    benchmark = yf.download(benchmark_ticker, start=START_DATE, end=END_DATE)["Close"]
-    benchmark_rets = benchmark.pct_change().dropna()
+    total_profit = portfolio.total_profit().sum()
+    total_return = (total_profit / INITIAL_CASH) * 100
 
-    total_return = portfolio.total_return().mean() * 100
-    annualized_return = (
-        portfolio.annualized_return().mean() * 100
-        if not portfolio.trades.records_readable.empty
+    trades = portfolio.trades.records_readable  # Ensure we're using the readable format
+
+    # Correct column name from 'pnl' to 'PnL'
+    profitable_trades = trades["PnL"] > 0
+    num_profitable_trades = profitable_trades.sum()
+    total_closed_trades = trades["PnL"].count()  # Use count on the 'PnL' series
+    win_rate = (
+        (num_profitable_trades / total_closed_trades) * 100
+        if total_closed_trades > 0
         else 0
     )
-    max_dd = portfolio.max_drawdown().mean() * 100
 
-    bench_return = (
-        (benchmark.iloc[-1] / benchmark.iloc[0] - 1) * 100 if len(benchmark) > 0 else 0
-    )
-    bench_vol = (
-        benchmark_rets.std() * (252**0.5) * 100 if len(benchmark_rets) > 0 else 0
+    total_gains = trades.loc[profitable_trades, "PnL"].sum()
+    total_losses = trades.loc[~profitable_trades, "PnL"].sum()
+    profit_factor = (
+        total_gains / abs(total_losses) if total_losses != 0 else float("inf")
     )
 
-    trades = portfolio.trades.records_readable
-    win_rate = (trades["Status"] == "Win").mean() * 100 if not trades.empty else 0
+    average_win = (
+        trades.loc[profitable_trades, "PnL"].mean() if num_profitable_trades > 0 else 0
+    )
+    average_loss = (
+        trades.loc[~profitable_trades, "PnL"].mean()
+        if (total_closed_trades - num_profitable_trades) > 0
+        else 0
+    )
+    risk_to_reward_ratio = (
+        average_win / abs(average_loss) if average_loss != 0 else float("inf")
+    )
 
-    evaluation = {
-        "Total Return (%)": round(total_return, 2),
-        "Annualized Return (%)": round(annualized_return, 2),
-        "Benchmark Return (%)": round(bench_return, 2),
-        "Max Drawdown (%)": round(max_dd, 2),
-        "Benchmark Volatility (%)": round(bench_vol, 2),
-        "Total Trades": len(trades),
-        "Win Rate (%)": round(win_rate, 2),
-        "Profit Factor": (
-            round(trade_stats.get("Profit Factor", np.nan), 2)
-            if not trade_stats.empty
-            else np.nan
-        ),
-        "Avg Win Trade (%)": (
-            round(trade_stats.get("Avg Winning Trade [%]", np.nan), 2)
-            if not trade_stats.empty
-            else np.nan
-        ),
-        "Avg Loss Trade (%)": (
-            round(trade_stats.get("Avg Losing Trade [%]", np.nan), 2)
-            if not trade_stats.empty
-            else np.nan
-        ),
-    }
+    largest_win = trades["PnL"].max() if not trades.empty else 0
+    largest_win_trade_id = trades["PnL"].idxmax() if not trades.empty else None
+    largest_loss = trades["PnL"].min() if not trades.empty else 0
+    largest_loss_trade_id = trades["PnL"].idxmin() if not trades.empty else None
 
-    logger.info("\nStrategy Evaluation:")
-    for metric, value in evaluation.items():
-        logger.info("%s %s", metric.ljust(30, "."), value)
+    loss_rate = 1 - (win_rate / 100)
+    expectancy = (win_rate / 100 * average_win) + (loss_rate * average_loss)
+    max_drawdown = portfolio.drawdowns.max_drawdown().min()
 
-    if not portfolio.trades.records_readable.empty:
-        fig = portfolio.plot(
-            subplots=[
-                ("cum_returns", {"title": "Cumulative Returns"}),
-                ("drawdowns", {"title": "Drawdowns"}),
-            ]
-        )
-        fig.show()
+    evaluation = [
+        f"Total Profit/Loss (PnL): ${total_profit:.2f}",
+        f"Total Return: {total_return:.2f}%",
+        f"Profitable Trades: {num_profitable_trades}",
+        f"Total Closed Trades: {total_closed_trades}",
+        f"Win Rate: {win_rate:.2f}%",
+        f"Total Gains: ${total_gains:.2f}",
+        f"Total Losses: ${total_losses:.2f}",
+        f"Profit Factor: {profit_factor:.2f}",
+        f"Average Win: ${average_win:.2f}",
+        f"Average Loss: ${average_loss:.2f}",
+        f"Risk-to-Reward Ratio: {risk_to_reward_ratio:.2f}",
+        f"Largest Single Win: ${largest_win:.2f} (Trade ID {largest_win_trade_id})",
+        f"Largest Single Loss: ${largest_loss:.2f} (Trade ID {largest_loss_trade_id})",
+        f"Expectancy: ${expectancy:.2f} per trade",
+        f"Max Drawdown: {max_drawdown:.2f}%",
+    ]
 
     return evaluation
 
@@ -355,8 +356,7 @@ def main():
 
     # Setup logging
     logging.basicConfig(level=logging.INFO)
-    global logger, tickers, daily_data_dict, weekly_data_dict, date_index
-    logger = logging.getLogger(__name__)
+    global tickers, daily_data_dict, weekly_data_dict, date_index
 
     # Read tickers from CSV
     tickers_df = pd.read_csv(os.path.join("input", CSV_NAME))
@@ -474,7 +474,10 @@ def main():
     )
 
     # Evaluate strategy and save trades
-    evaluate_strategy(portfolio)
+    evaluation = evaluate_strategy(portfolio)
+    for entry in evaluation:
+        print(entry)
+
     trades_df = portfolio.trades.records_readable
     trades_df.to_csv("strategy_trades.csv", index=False)
 
