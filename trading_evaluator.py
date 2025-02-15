@@ -10,7 +10,7 @@ import os
 import time
 from datetime import datetime
 from random import uniform
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -28,8 +28,9 @@ EMA_WEEKLY_FAST = 20
 EMA_WEEKLY_SLOW = 50
 EMA_DAILY = 50
 
-# Set this flag to True to download all tickers; set to False to use individual cached files.
-DOWNLOAD_NEW_DATA = False
+DOWNLOAD_NEW_DATA = (
+    False  # Set to True to download all tickers; False to use cached files.
+)
 CSV_NAME = (
     "mega.csv"  # Downloaded from https://www.nasdaq.com/market-activity/stocks/screener
 )
@@ -42,18 +43,19 @@ REQUEST_DELAY = 1.5
 BATCH_SIZE = 10
 CACHE_EXPIRATION_DAYS = 7
 
+# Global variables to be populated in main()
+daily_data_dict = {}
+weekly_data_dict = {}
+date_index = None
+tickers = []
 
+
+# -----------------------------
+# Data Download and Utility Functions
+# -----------------------------
 def flatten_columns(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     """
     Flatten the columns of a DataFrame if they are a MultiIndex or tuple-based.
-
-    Parameters:
-        df (Optional[pd.DataFrame]): The DataFrame whose columns may be a MultiIndex or
-            contain tuples.
-
-    Returns:
-        pd.DataFrame: The DataFrame with flattened column names.
-        Returns an empty DataFrame if df is None.
     """
     if df is None:
         return pd.DataFrame()
@@ -68,17 +70,6 @@ def flatten_columns(df: Optional[pd.DataFrame]) -> pd.DataFrame:
 def download_data_with_retry(ticker_list, interval, session, start, end, retries=0):
     """
     Download data for a list of tickers with retries and throttling.
-
-    Parameters:
-        ticker_list (list): List of ticker symbols.
-        interval (str): Data interval (e.g., '1d', '1wk').
-        session (requests.Session): The session object to use for downloading.
-        start (str): Start date for data.
-        end (str): End date for data.
-        retries (int): Current number of retries.
-
-    Returns:
-        pd.DataFrame: DataFrame containing the downloaded data.
     """
     try:
         logger.info(
@@ -114,16 +105,6 @@ def download_data_with_retry(ticker_list, interval, session, start, end, retries
 def download_data_all(interval, session, ticker_list, start=START_DATE, end=END_DATE):
     """
     Download data for all tickers in batches with rate limiting, using caching.
-
-    Parameters:
-        interval (str): Data interval (e.g., '1d', '1wk').
-        session (requests.Session): The session object to use for downloading.
-        ticker_list (list): List of ticker symbols.
-        start (str): Start date for data.
-        end (str): End date for data.
-
-    Returns:
-        pd.DataFrame: Combined DataFrame of all downloaded data.
     """
     filename = os.path.join(CACHE_DIR, f"{interval}.csv")
     if os.path.exists(filename):
@@ -152,35 +133,51 @@ def download_data_all(interval, session, ticker_list, start=START_DATE, end=END_
     return pd.DataFrame()
 
 
-def process_ticker(ticker):
+# -----------------------------
+# Strategy Classes
+# -----------------------------
+class BaseStrategy:
     """
-    Process a single ticker to generate trading signals and position sizes.
-
-    Parameters:
-        ticker (str): The ticker symbol to process.
-
-    Returns:
-        tuple: A tuple of three pandas Series (ticker_entries, ticker_exits, ticker_sizes) for
-        trading entries, exits, and position sizes, respectively.
-        Returns (None, None, None) on failure.
+    Base strategy interface. New strategies should inherit from this class and implement
+    the generate_signals method.
     """
-    logger.info("Processing %s...", ticker)
-    try:
-        if ticker not in daily_data_dict or ticker not in weekly_data_dict:
-            logger.warning("No data available for %s", ticker)
-            return None, None, None
 
-        daily = daily_data_dict.get(ticker, pd.DataFrame())
-        weekly = weekly_data_dict.get(ticker, pd.DataFrame())
+    def generate_signals(
+        self, daily: pd.DataFrame, weekly: pd.DataFrame, date_index: pd.DatetimeIndex
+    ) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        raise NotImplementedError("Subclasses should implement this method.")
 
+
+class DefaultStrategy(BaseStrategy):
+    """
+    Default trading strategy based on a combination of weekly and daily EMAs.
+    """
+
+    def __init__(
+        self,
+        ema_weekly_fast: int,
+        ema_weekly_slow: int,
+        ema_daily: int,
+        risk_per_trade: float,
+        initial_cash: float,
+    ):
+        self.ema_weekly_fast = ema_weekly_fast
+        self.ema_weekly_slow = ema_weekly_slow
+        self.ema_daily = ema_daily
+        self.risk_per_trade = risk_per_trade
+        self.initial_cash = initial_cash
+
+    def generate_signals(
+        self, daily: pd.DataFrame, weekly: pd.DataFrame, date_index: pd.DatetimeIndex
+    ) -> Tuple[pd.Series, pd.Series, pd.Series]:
         # Calculate EMAs using vectorbt's MA indicator with exponential weighting
         weekly["ema20"] = vbt.MA.run(
-            weekly["Close"], window=EMA_WEEKLY_FAST, ewm=True
+            weekly["Close"], window=self.ema_weekly_fast, ewm=True
         ).ma
         weekly["ema50"] = vbt.MA.run(
-            weekly["Close"], window=EMA_WEEKLY_SLOW, ewm=True
+            weekly["Close"], window=self.ema_weekly_slow, ewm=True
         ).ma
-        daily["ema50"] = vbt.MA.run(daily["Close"], window=EMA_DAILY, ewm=True).ma
+        daily["ema50"] = vbt.MA.run(daily["Close"], window=self.ema_daily, ewm=True).ma
 
         # Resample weekly EMA data to daily frequency and rename columns
         weekly_daily = (
@@ -229,7 +226,9 @@ def process_ticker(ticker):
                 risk_per_share = close - stop_loss_val
                 if risk_per_share == 0:
                     continue
-                position_size = (INITIAL_CASH * RISK_PER_TRADE) / risk_per_share
+                position_size = (
+                    self.initial_cash * self.risk_per_trade
+                ) / risk_per_share
                 ticker_entries.iloc[i] = True
                 ticker_sizes.iloc[i] = position_size
                 entry_price = close
@@ -245,26 +244,43 @@ def process_ticker(ticker):
                     ticker_exits.iloc[i] = True
                     in_position = False
 
+        # Reindex to the full date range
         ticker_entries = ticker_entries.reindex(date_index, fill_value=False)
         ticker_exits = ticker_exits.reindex(date_index, fill_value=False)
         ticker_sizes = ticker_sizes.reindex(date_index, fill_value=0)
         return ticker_entries, ticker_exits, ticker_sizes
 
-    except (KeyError, IndexError, ValueError) as error:
+
+# -----------------------------
+# Ticker Processing
+# -----------------------------
+def process_ticker(
+    ticker: str, strategy: BaseStrategy
+) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
+    """
+    Process a single ticker to generate trading signals using the provided strategy.
+    """
+    logger.info("Processing %s...", ticker)
+    try:
+        if ticker not in daily_data_dict or ticker not in weekly_data_dict:
+            logger.warning("No data available for %s", ticker)
+            return None, None, None
+
+        daily = daily_data_dict.get(ticker, pd.DataFrame())
+        weekly = weekly_data_dict.get(ticker, pd.DataFrame())
+
+        return strategy.generate_signals(daily, weekly, date_index)
+    except Exception as error:
         logger.error("Error processing %s: %s", ticker, error)
         return None, None, None
 
 
+# -----------------------------
+# Strategy Evaluation
+# -----------------------------
 def evaluate_strategy(portfolio, benchmark_ticker="SPY"):
     """
-    Evaluate the performance of a trading strategy using portfolio statistics and benchmark comparison.
-
-    Parameters:
-        portfolio (vbt.Portfolio): The portfolio object containing trading signals and performance data.
-        benchmark_ticker (str): The ticker symbol for the benchmark (default is 'SPY').
-
-    Returns:
-        dict: A dictionary containing evaluation metrics.
+    Evaluate the performance of a trading strategy.
     """
     trade_stats = portfolio.trades.stats()
     benchmark = yf.download(benchmark_ticker, start=START_DATE, end=END_DATE)["Close"]
@@ -329,6 +345,9 @@ def evaluate_strategy(portfolio, benchmark_ticker="SPY"):
     return evaluation
 
 
+# -----------------------------
+# Main Execution
+# -----------------------------
 def main():
     # Create cache directory if needed
     if not os.path.exists(CACHE_DIR):
@@ -344,8 +363,8 @@ def main():
     tickers = [t.replace("/", "-") for t in tickers_df["Symbol"].to_list()]
 
     # Prepare data dictionaries
-    daily_data_dict = {}
-    weekly_data_dict = {}
+    daily_data_dict.clear()
+    weekly_data_dict.clear()
 
     if DOWNLOAD_NEW_DATA:
         session = requests.Session()
@@ -375,7 +394,7 @@ def main():
             os.path.join(CACHE_DIR, "1wk.csv"), index_col="Date", parse_dates=True
         )
 
-    # Populate the data dictionaries
+    # Populate the data dictionaries for each ticker
     for ticker in tickers:
         daily_cols = [col for col in daily_all.columns if col.startswith(f"{ticker}_")]
         if daily_cols:
@@ -394,17 +413,30 @@ def main():
     if missing_tickers:
         logger.warning("Missing data for tickers: %s", missing_tickers)
 
-    # Prepare global dataframes for signals
+    # Prepare global date index for signal alignment
     date_index = pd.date_range(start=START_DATE, end=END_DATE)
+
+    # Initialize strategy instance.
+    # To test different strategies, simply instantiate a different subclass of BaseStrategy here.
+    default_strategy = DefaultStrategy(
+        ema_weekly_fast=EMA_WEEKLY_FAST,
+        ema_weekly_slow=EMA_WEEKLY_SLOW,
+        ema_daily=EMA_DAILY,
+        risk_per_trade=RISK_PER_TRADE,
+        initial_cash=INITIAL_CASH,
+    )
+
+    # Prepare DataFrames to hold signals
     entries = pd.DataFrame(False, index=date_index, columns=tickers, dtype=bool)
     exits = pd.DataFrame(False, index=date_index, columns=tickers, dtype=bool)
     sizes = pd.DataFrame(0.0, index=date_index, columns=tickers, dtype=float)
 
-    # Process tickers in parallel
+    # Process tickers in parallel using the selected strategy
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         future_to_ticker = {
-            executor.submit(process_ticker, ticker): ticker for ticker in tickers
+            executor.submit(process_ticker, ticker, default_strategy): ticker
+            for ticker in tickers
         }
         for future in concurrent.futures.as_completed(future_to_ticker):
             ticker_item = future_to_ticker[future]
@@ -412,7 +444,7 @@ def main():
                 t_entries, t_exits, t_sizes = future.result()
                 if t_entries is not None:
                     results[ticker_item] = (t_entries, t_exits, t_sizes)
-            except (KeyError, IndexError, ValueError, RequestException) as exc:
+            except Exception as exc:
                 logger.error("%s generated an exception: %s", ticker_item, exc)
 
     for ticker_item, (t_entries, t_exits, t_sizes) in results.items():
@@ -420,6 +452,7 @@ def main():
         exits[ticker_item] = t_exits
         sizes[ticker_item] = t_sizes
 
+    # Build close prices DataFrame
     close_prices = pd.DataFrame(index=date_index, columns=tickers)
     for ticker_item in tickers:
         if ticker_item in daily_data_dict:
