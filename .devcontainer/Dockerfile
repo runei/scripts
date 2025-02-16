@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
 # Create a virtual environment and install packages
 RUN python3 -m venv /venv && \
     /venv/bin/pip install --upgrade pip && \
-    /venv/bin/pip install pandas numpy vectorbt yfinance
+    /venv/bin/pip install pandas numpy vectorbt yfinance pylint black pytest
 
 # Set environment variables so the virtual environment is used by default
 ENV PATH="/venv/bin:$PATH"

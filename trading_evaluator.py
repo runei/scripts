@@ -24,15 +24,14 @@ from requests.exceptions import RequestException
 # -----------------------------
 RISK_PER_TRADE = 0.01  # 1% of portfolio per trade
 INITIAL_CASH = 10000
+PROFIT_FACTOR = 4
 EMA_WEEKLY_FAST = 20
 EMA_WEEKLY_SLOW = 50
 EMA_DAILY = 50
 
-DOWNLOAD_NEW_DATA = (
-    False  # Set to True to download all tickers; False to use cached files.
-)
+DOWNLOAD_NEW_DATA = False
 CSV_NAME = (
-    "mega.csv"  # Downloaded from https://www.nasdaq.com/market-activity/stocks/screener
+    "large"  # Downloaded from https://www.nasdaq.com/market-activity/stocks/screener
 )
 CACHE_DIR = "cache"
 START_DATE = "2015-01-01"
@@ -107,7 +106,7 @@ def download_data_all(interval, session, ticker_list, start=START_DATE, end=END_
     """
     Download data for all tickers in batches with rate limiting, using caching.
     """
-    filename = os.path.join(CACHE_DIR, f"{interval}.csv")
+    filename = os.path.join(CACHE_DIR, CSV_NAME + f"{interval}.csv")
     if os.path.exists(filename):
         file_age = (
             datetime.now() - datetime.fromtimestamp(os.path.getmtime(filename))
@@ -170,8 +169,7 @@ class DefaultStrategy(BaseStrategy):
 
     def generate_signals(
         self, daily: pd.DataFrame, weekly: pd.DataFrame, date_index: pd.DatetimeIndex
-    ) -> Tuple[pd.Series, pd.Series, pd.Series]:
-        # Calculate EMAs using vectorbt's MA indicator with exponential weighting
+    ) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
         weekly["ema20"] = vbt.MA.run(
             weekly["Close"], window=self.ema_weekly_fast, ewm=True
         ).ma
@@ -180,14 +178,12 @@ class DefaultStrategy(BaseStrategy):
         ).ma
         daily["ema50"] = vbt.MA.run(daily["Close"], window=self.ema_daily, ewm=True).ma
 
-        # Resample weekly EMA data to daily frequency and rename columns
         weekly_daily = (
             weekly.resample("D")
             .ffill()[["ema20", "ema50"]]
             .rename(columns=lambda col: f"{col}_weekly")
         )
 
-        # Join daily data with the resampled weekly EMAs
         aligned_data = daily.merge(
             weekly_daily, left_index=True, right_index=True, how="left"
         )
@@ -198,12 +194,12 @@ class DefaultStrategy(BaseStrategy):
         ticker_entries = pd.Series(False, index=aligned_data.index, dtype=bool)
         ticker_exits = pd.Series(False, index=aligned_data.index, dtype=bool)
         ticker_sizes = pd.Series(0.0, index=aligned_data.index, dtype=float)
+        exit_prices = pd.Series(np.nan, index=aligned_data.index, dtype=float)
 
         in_position = False
         entry_price = 0.0
         stop_loss_val = 0.0
 
-        # Loop over the aligned data starting from the third row
         for i in range(2, len(aligned_data)):
             ema20 = aligned_data["ema20_weekly"].iloc[i]
             ema50 = aligned_data["ema50_weekly"].iloc[i]
@@ -236,20 +232,27 @@ class DefaultStrategy(BaseStrategy):
                 in_position = True
 
             if in_position:
-                take_profit = entry_price + 3 * (entry_price - stop_loss_val)
-                if (
-                    (close <= stop_loss_val)
-                    or (close >= take_profit)
-                    or weekly_downtrend
-                ):
+                take_profit = entry_price + PROFIT_FACTOR * (
+                    entry_price - stop_loss_val
+                )
+                if close <= stop_loss_val:
                     ticker_exits.iloc[i] = True
+                    exit_prices.iloc[i] = stop_loss_val
+                    in_position = False
+                elif close >= take_profit:
+                    ticker_exits.iloc[i] = True
+                    exit_prices.iloc[i] = take_profit
+                    in_position = False
+                elif weekly_downtrend:
+                    ticker_exits.iloc[i] = True
+                    exit_prices.iloc[i] = close
                     in_position = False
 
-        # Reindex to the full date range
         ticker_entries = ticker_entries.reindex(date_index, fill_value=False)
         ticker_exits = ticker_exits.reindex(date_index, fill_value=False)
         ticker_sizes = ticker_sizes.reindex(date_index, fill_value=0)
-        return ticker_entries, ticker_exits, ticker_sizes
+        exit_prices = exit_prices.reindex(date_index)
+        return ticker_entries, ticker_exits, ticker_sizes, exit_prices
 
 
 # -----------------------------
@@ -257,7 +260,9 @@ class DefaultStrategy(BaseStrategy):
 # -----------------------------
 def process_ticker(
     ticker: str, strategy: BaseStrategy
-) -> Tuple[Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]]:
+) -> Tuple[
+    Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]
+]:
     """
     Process a single ticker to generate trading signals using the provided strategy.
     """
@@ -265,7 +270,7 @@ def process_ticker(
     try:
         if ticker not in daily_data_dict or ticker not in weekly_data_dict:
             logger.warning("No data available for %s", ticker)
-            return None, None, None
+            return None, None, None, None
 
         daily = daily_data_dict.get(ticker, pd.DataFrame())
         weekly = weekly_data_dict.get(ticker, pd.DataFrame())
@@ -273,25 +278,24 @@ def process_ticker(
         return strategy.generate_signals(daily, weekly, date_index)
     except Exception as error:
         logger.error("Error processing %s: %s", ticker, error)
-        return None, None, None
+        return None, None, None, None
 
 
 # -----------------------------
 # Strategy Evaluation
 # -----------------------------
-def evaluate_strategy(portfolio, benchmark_ticker="SPY"):
+def evaluate_strategy(portfolio):
     """
     Evaluate the performance of a trading strategy.
     """
     total_profit = portfolio.total_profit().sum()
     total_return = (total_profit / INITIAL_CASH) * 100
 
-    trades = portfolio.trades.records_readable  # Ensure we're using the readable format
+    trades = portfolio.trades.records_readable
 
-    # Correct column name from 'pnl' to 'PnL'
     profitable_trades = trades["PnL"] > 0
     num_profitable_trades = profitable_trades.sum()
-    total_closed_trades = trades["PnL"].count()  # Use count on the 'PnL' series
+    total_closed_trades = trades["PnL"].count()
     win_rate = (
         (num_profitable_trades / total_closed_trades) * 100
         if total_closed_trades > 0
@@ -350,19 +354,15 @@ def evaluate_strategy(portfolio, benchmark_ticker="SPY"):
 # Main Execution
 # -----------------------------
 def main():
-    # Create cache directory if needed
     if not os.path.exists(CACHE_DIR):
         os.makedirs(CACHE_DIR)
 
-    # Setup logging
     logging.basicConfig(level=logging.INFO)
     global tickers, daily_data_dict, weekly_data_dict, date_index
 
-    # Read tickers from CSV
-    tickers_df = pd.read_csv(os.path.join("input", CSV_NAME))
+    tickers_df = pd.read_csv(os.path.join("input", CSV_NAME + ".csv"))
     tickers = [t.replace("/", "-") for t in tickers_df["Symbol"].to_list()]
 
-    # Prepare data dictionaries
     daily_data_dict.clear()
     weekly_data_dict.clear()
 
@@ -388,13 +388,16 @@ def main():
     else:
         logger.info("Loading cached combined data")
         daily_all = pd.read_csv(
-            os.path.join(CACHE_DIR, "1d.csv"), index_col="Date", parse_dates=True
+            os.path.join(CACHE_DIR, CSV_NAME + "1d.csv"),
+            index_col="Date",
+            parse_dates=True,
         )
         weekly_all = pd.read_csv(
-            os.path.join(CACHE_DIR, "1wk.csv"), index_col="Date", parse_dates=True
+            os.path.join(CACHE_DIR, CSV_NAME + "1wk.csv"),
+            index_col="Date",
+            parse_dates=True,
         )
 
-    # Populate the data dictionaries for each ticker
     for ticker in tickers:
         daily_cols = [col for col in daily_all.columns if col.startswith(f"{ticker}_")]
         if daily_cols:
@@ -413,11 +416,8 @@ def main():
     if missing_tickers:
         logger.warning("Missing data for tickers: %s", missing_tickers)
 
-    # Prepare global date index for signal alignment
     date_index = pd.date_range(start=START_DATE, end=END_DATE)
 
-    # Initialize strategy instance.
-    # To test different strategies, simply instantiate a different subclass of BaseStrategy here.
     default_strategy = DefaultStrategy(
         ema_weekly_fast=EMA_WEEKLY_FAST,
         ema_weekly_slow=EMA_WEEKLY_SLOW,
@@ -426,12 +426,10 @@ def main():
         initial_cash=INITIAL_CASH,
     )
 
-    # Prepare DataFrames to hold signals
     entries = pd.DataFrame(False, index=date_index, columns=tickers, dtype=bool)
     exits = pd.DataFrame(False, index=date_index, columns=tickers, dtype=bool)
     sizes = pd.DataFrame(0.0, index=date_index, columns=tickers, dtype=float)
 
-    # Process tickers in parallel using the selected strategy
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         future_to_ticker = {
@@ -441,18 +439,18 @@ def main():
         for future in concurrent.futures.as_completed(future_to_ticker):
             ticker_item = future_to_ticker[future]
             try:
-                t_entries, t_exits, t_sizes = future.result()
+                t_entries, t_exits, t_sizes, t_exit_prices = future.result()
                 if t_entries is not None:
-                    results[ticker_item] = (t_entries, t_exits, t_sizes)
+                    results[ticker_item] = (t_entries, t_exits, t_sizes, t_exit_prices)
             except Exception as exc:
                 logger.error("%s generated an exception: %s", ticker_item, exc)
 
-    for ticker_item, (t_entries, t_exits, t_sizes) in results.items():
+    for ticker_item, (t_entries, t_exits, t_sizes, t_exit_prices) in results.items():
         entries[ticker_item] = t_entries
         exits[ticker_item] = t_exits
         sizes[ticker_item] = t_sizes
 
-    # Build close prices DataFrame
+    # Build close_prices from daily data
     close_prices = pd.DataFrame(index=date_index, columns=tickers)
     for ticker_item in tickers:
         if ticker_item in daily_data_dict:
@@ -461,7 +459,14 @@ def main():
             close_prices[ticker_item] = np.nan
     close_prices = close_prices.astype(np.float64)
 
-    # Create portfolio using vectorbt
+    # Override exit prices in close_prices with custom exit prices from our strategy.
+    # This way, when a trade is exited, the exit price will be the stop loss or profit target.
+    for ticker_item, (_, t_exits, _, t_exit_prices) in results.items():
+        exit_dates = t_exit_prices[t_exits].index
+        for date in exit_dates:
+            if not pd.isna(t_exit_prices.loc[date]):
+                close_prices.loc[date, ticker_item] = t_exit_prices.loc[date]
+
     portfolio = vbt.Portfolio.from_signals(
         close=close_prices,
         entries=entries,
@@ -473,7 +478,6 @@ def main():
         upon_opposite_entry="close",
     )
 
-    # Evaluate strategy and save trades
     evaluation = evaluate_strategy(portfolio)
     for entry in evaluation:
         print(entry)
