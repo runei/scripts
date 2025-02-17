@@ -24,7 +24,7 @@ from requests.exceptions import RequestException
 # -----------------------------
 RISK_PER_TRADE = 0.01  # 1% of portfolio per trade
 INITIAL_CASH = 10000
-PROFIT_FACTOR = 5
+PROFIT_FACTOR = 3
 EMA_WEEKLY_FAST = 20
 EMA_WEEKLY_SLOW = 50
 EMA_DAILY = 50
@@ -208,6 +208,7 @@ class DefaultStrategy(BaseStrategy):
             ema50 = aligned_data["ema50_weekly"].iloc[i]
             close = aligned_data["Close"].iloc[i]
             low = aligned_data["Low"].iloc[i]
+            high = aligned_data["High"].iloc[i]
             prev_low = aligned_data["Low"].iloc[i - 1]
             prev_high = aligned_data["High"].iloc[i - 1]
 
@@ -238,11 +239,11 @@ class DefaultStrategy(BaseStrategy):
                 take_profit = entry_price + PROFIT_FACTOR * (
                     entry_price - stop_loss_val
                 )
-                if close <= stop_loss_val:
+                if low <= stop_loss_val:
                     ticker_exits.iloc[i] = True
                     exit_prices.iloc[i] = stop_loss_val
                     in_position = False
-                elif close >= take_profit:
+                elif high >= take_profit:
                     ticker_exits.iloc[i] = True
                     exit_prices.iloc[i] = take_profit
                     in_position = False
@@ -255,6 +256,157 @@ class DefaultStrategy(BaseStrategy):
         ticker_exits = ticker_exits.reindex(date_index, fill_value=False)
         ticker_sizes = ticker_sizes.reindex(date_index, fill_value=0)
         exit_prices = exit_prices.reindex(date_index)
+        return ticker_entries, ticker_exits, ticker_sizes, exit_prices
+
+
+class TrendMomentumVolumeATRStrategy(BaseStrategy):
+    """
+    Enhanced trading strategy incorporating RSI, ATR for dynamic stops, and volume filters.
+    """
+
+    def __init__(
+        self,
+        ema_weekly_fast: int,
+        ema_weekly_slow: int,
+        ema_daily: int,
+        risk_per_trade: float,
+        initial_cash: float,
+        rsi_window: int = 14,
+        atr_window: int = 14,
+        volume_ma_window: int = 20,
+    ):
+        # Remove the call to super().__init__() to avoid passing extra arguments to object.__init__
+        self.ema_weekly_fast = ema_weekly_fast
+        self.ema_weekly_slow = ema_weekly_slow
+        self.ema_daily = ema_daily
+        self.risk_per_trade = risk_per_trade
+        self.initial_cash = initial_cash
+        self.rsi_window = rsi_window
+        self.atr_window = atr_window
+        self.volume_ma_window = volume_ma_window
+
+    def generate_signals(
+        self, daily: pd.DataFrame, weekly: pd.DataFrame, date_index: pd.DatetimeIndex
+    ) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+        # (The rest of the method remains unchanged)
+        # Weekly EMAs
+        weekly["ema20"] = vbt.MA.run(
+            weekly["Close"], window=self.ema_weekly_fast, ewm=True
+        ).ma
+        weekly["ema50"] = vbt.MA.run(
+            weekly["Close"], window=self.ema_weekly_slow, ewm=True
+        ).ma
+
+        # Daily indicators
+        daily["ema50"] = vbt.MA.run(daily["Close"], window=self.ema_daily, ewm=True).ma
+        daily["rsi"] = vbt.RSI.run(daily["Close"], window=self.rsi_window).rsi
+        atr = vbt.ATR.run(
+            daily["High"], daily["Low"], daily["Close"], window=self.atr_window
+        )
+        daily["atr"] = atr.atr
+        daily["volume_ma"] = (
+            daily["Volume"].rolling(window=self.volume_ma_window).mean()
+        )
+
+        # Align weekly data to daily
+        weekly_daily = (
+            weekly.resample("D")
+            .ffill()[["ema20", "ema50"]]
+            .rename(columns=lambda col: f"{col}_weekly")
+        )
+        aligned_data = daily.merge(
+            weekly_daily, left_index=True, right_index=True, how="left"
+        )
+
+        # Initialize signal series
+        ticker_entries = pd.Series(False, index=aligned_data.index, dtype=bool)
+        ticker_exits = pd.Series(False, index=aligned_data.index, dtype=bool)
+        ticker_sizes = pd.Series(0.0, index=aligned_data.index, dtype=float)
+        exit_prices = pd.Series(np.nan, index=aligned_data.index, dtype=float)
+
+        in_position = False
+        entry_price = 0.0
+        initial_atr = 0.0
+        highest_high = 0.0
+        take_profit = 0.0
+
+        for i in range(2, len(aligned_data)):
+            # Current data points
+            current = aligned_data.iloc[i]
+            prev = aligned_data.iloc[i - 1]
+            prev_prev = aligned_data.iloc[i - 2]
+
+            # Trend conditions
+            weekly_uptrend = (current["ema20_weekly"] > current["ema50_weekly"]) and (
+                current["Close"] > current["ema20_weekly"]
+            )
+            weekly_downtrend = (current["ema20_weekly"] < current["ema50_weekly"]) and (
+                current["Close"] < current["ema20_weekly"]
+            )
+
+            # Reversal pattern: Bullish engulfing or higher low followed by breakout
+            bullish_reversal = (prev_prev["Low"] > prev["Low"]) and (  # Lower low
+                current["Close"] > prev["High"]
+            )  # Close above previous high
+
+            # Indicator conditions
+            above_ema50 = current["Close"] > current["ema50"]
+            rsi_ok = (current["rsi"] > 50) and (current["rsi"] < 70)  # Avoid overbought
+            volume_ok = current["Volume"] > current["volume_ma"]
+
+            # Entry logic
+            if (
+                not in_position
+                and weekly_uptrend
+                and bullish_reversal
+                and above_ema50
+                and rsi_ok
+                and volume_ok
+            ):
+                risk_per_share = 2 * current["atr"]
+                if risk_per_share == 0:
+                    continue
+                position_size = (
+                    self.initial_cash * self.risk_per_trade
+                ) / risk_per_share
+                entry_price = current["Close"]
+                initial_atr = current["atr"]
+                highest_high = current["High"]
+                take_profit = entry_price + 3 * risk_per_share  # 3:1 reward:risk
+
+                ticker_entries.iloc[i] = True
+                ticker_sizes.iloc[i] = position_size
+                in_position = True
+
+            # Exit logic
+            if in_position:
+                # Update highest high during trade
+                if current["High"] > highest_high:
+                    highest_high = current["High"]
+
+                # Trailing stop: 1.5*ATR below highest high
+                trailing_stop = highest_high - 1.5 * initial_atr
+                current_close = current["Close"]
+
+                # Check exit conditions
+                if current_close <= trailing_stop or current_close >= take_profit:
+                    exit_price = (
+                        trailing_stop if current_close <= trailing_stop else take_profit
+                    )
+                    ticker_exits.iloc[i] = True
+                    exit_prices.iloc[i] = exit_price
+                    in_position = False
+                elif weekly_downtrend:
+                    ticker_exits.iloc[i] = True
+                    exit_prices.iloc[i] = current_close
+                    in_position = False
+
+        # Reindex to match full date index
+        ticker_entries = ticker_entries.reindex(date_index, fill_value=False)
+        ticker_exits = ticker_exits.reindex(date_index, fill_value=False)
+        ticker_sizes = ticker_sizes.reindex(date_index, fill_value=0)
+        exit_prices = exit_prices.reindex(date_index)
+
         return ticker_entries, ticker_exits, ticker_sizes, exit_prices
 
 
@@ -353,6 +505,23 @@ def evaluate_strategy(portfolio):
     return evaluation
 
 
+def get_strategy():
+    # return De0faultStrategy(
+    #     ema_weekly_fast=EMA_WEEKLY_FAST,
+    #     ema_weekly_slow=EMA_WEEKLY_SLOW,
+    #     ema_daily=EMA_DAILY,
+    #     risk_per_trade=RISK_PER_TRADE,
+    #     initial_cash=INITIAL_CASH,
+    # )
+    return TrendMomentumVolumeATRStrategy(
+        ema_weekly_fast=EMA_WEEKLY_FAST,
+        ema_weekly_slow=EMA_WEEKLY_SLOW,
+        ema_daily=EMA_DAILY,
+        risk_per_trade=RISK_PER_TRADE,
+        initial_cash=INITIAL_CASH,
+    )
+
+
 # -----------------------------
 # Main Execution
 # -----------------------------
@@ -421,13 +590,7 @@ def main():
 
     date_index = pd.date_range(start=START_DATE, end=END_DATE)
 
-    default_strategy = DefaultStrategy(
-        ema_weekly_fast=EMA_WEEKLY_FAST,
-        ema_weekly_slow=EMA_WEEKLY_SLOW,
-        ema_daily=EMA_DAILY,
-        risk_per_trade=RISK_PER_TRADE,
-        initial_cash=INITIAL_CASH,
-    )
+    default_strategy = get_strategy()
 
     entries = pd.DataFrame(False, index=date_index, columns=tickers, dtype=bool)
     exits = pd.DataFrame(False, index=date_index, columns=tickers, dtype=bool)
