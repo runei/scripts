@@ -25,13 +25,10 @@ from requests.exceptions import RequestException
 RISK_PER_TRADE = 0.01  # 1% of portfolio per trade
 INITIAL_CASH = 10000
 PROFIT_FACTOR = 3
-EMA_WEEKLY_FAST = 20
-EMA_WEEKLY_SLOW = 50
-EMA_DAILY = 50
 
 DOWNLOAD_NEW_DATA = False
 CSV_NAME = (
-    "all"  # Downloaded from https://www.nasdaq.com/market-activity/stocks/screener
+    "mega"  # Downloaded from https://www.nasdaq.com/market-activity/stocks/screener
 )
 CACHE_DIR = "cache"
 START_DATE = "2015-01-01"
@@ -158,11 +155,11 @@ class DefaultStrategy(BaseStrategy):
 
     def __init__(
         self,
-        ema_weekly_fast: int,
-        ema_weekly_slow: int,
-        ema_daily: int,
-        risk_per_trade: float,
-        initial_cash: float,
+        ema_weekly_fast: int = 20,
+        ema_weekly_slow: int = 50,
+        ema_daily: int = 50,
+        risk_per_trade: float = RISK_PER_TRADE,
+        initial_cash: float = INITIAL_CASH,
     ):
         self.ema_weekly_fast = ema_weekly_fast
         self.ema_weekly_slow = ema_weekly_slow
@@ -266,11 +263,11 @@ class TrendMomentumVolumeATRStrategy(BaseStrategy):
 
     def __init__(
         self,
-        ema_weekly_fast: int,
-        ema_weekly_slow: int,
-        ema_daily: int,
-        risk_per_trade: float,
-        initial_cash: float,
+        ema_weekly_fast: int = 20,
+        ema_weekly_slow: int = 50,
+        ema_daily: int = 50,
+        risk_per_trade: float = RISK_PER_TRADE,
+        initial_cash: float = INITIAL_CASH,
         rsi_window: int = 14,
         atr_window: int = 14,
         volume_ma_window: int = 20,
@@ -410,6 +407,155 @@ class TrendMomentumVolumeATRStrategy(BaseStrategy):
         return ticker_entries, ticker_exits, ticker_sizes, exit_prices
 
 
+class EnhancedRSIMACDStrategy(BaseStrategy):
+    """
+    A new enhanced strategy combining:
+      - Weekly trend confirmation (weekly EMA fast > slow)
+      - Daily EMA crossover (fast EMA crossing above slow EMA)
+      - RSI filter (avoiding overbought/oversold extremes)
+      - MACD momentum (requiring positive histogram)
+      - ATR-based dynamic trailing stop for exits
+
+    This multi-indicator approach is designed to improve risk/reward and overall performance.
+    """
+
+    def __init__(
+        self,
+        ema_daily_fast: int = 12,
+        ema_daily_slow: int = 26,
+        weekly_fast: int = 20,
+        weekly_slow: int = 50,
+        risk_per_trade: float = RISK_PER_TRADE,
+        initial_cash: float = INITIAL_CASH,
+        rsi_lower: int = 40,
+        rsi_upper: int = 60,
+        atr_window: int = 14,
+        macd_fast: int = 12,
+        macd_slow: int = 26,
+        macd_signal: int = 9,
+    ):
+        self.ema_daily_fast = ema_daily_fast
+        self.ema_daily_slow = ema_daily_slow
+        self.weekly_fast = weekly_fast
+        self.weekly_slow = weekly_slow
+        self.risk_per_trade = risk_per_trade
+        self.initial_cash = initial_cash
+        self.rsi_lower = rsi_lower
+        self.rsi_upper = rsi_upper
+        self.atr_window = atr_window
+        self.macd_fast = macd_fast
+        self.macd_slow = macd_slow
+        self.macd_signal = macd_signal
+
+    def generate_signals(
+        self, daily: pd.DataFrame, weekly: pd.DataFrame, date_index: pd.DatetimeIndex
+    ) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+        # --- Compute Weekly Indicators ---
+        # Use positional arguments for MA.run
+        weekly["ema_fast"] = vbt.MA.run(weekly["Close"], self.weekly_fast).ma
+        weekly["ema_slow"] = vbt.MA.run(weekly["Close"], self.weekly_slow).ma
+
+        # Resample weekly indicators to daily frequency
+        weekly_daily = (
+            weekly.resample("D")
+            .ffill()[["ema_fast", "ema_slow"]]
+            .rename(columns=lambda col: f"{col}_weekly")
+        )
+
+        # --- Compute Daily Indicators ---
+        daily["ema_fast"] = vbt.MA.run(daily["Close"], self.ema_daily_fast).ma
+        daily["ema_slow"] = vbt.MA.run(daily["Close"], self.ema_daily_slow).ma
+        daily["rsi"] = vbt.RSI.run(daily["Close"], 14).rsi
+
+        # Use positional arguments for MACD.run
+        macd_obj = vbt.MACD.run(
+            daily["Close"], self.macd_fast, self.macd_slow, self.macd_signal
+        )
+        daily["macd_hist"] = macd_obj.hist
+
+        # Use positional arguments for ATR.run
+        atr = vbt.ATR.run(daily["High"], daily["Low"], daily["Close"], self.atr_window)
+        daily["atr"] = atr.atr
+
+        # --- Merge Weekly & Daily Data ---
+        aligned_data = daily.merge(
+            weekly_daily, left_index=True, right_index=True, how="left"
+        )
+
+        # --- Initialize Signal Series ---
+        ticker_entries = pd.Series(False, index=aligned_data.index, dtype=bool)
+        ticker_exits = pd.Series(False, index=aligned_data.index, dtype=bool)
+        ticker_sizes = pd.Series(0.0, index=aligned_data.index, dtype=float)
+        exit_prices = pd.Series(np.nan, index=aligned_data.index, dtype=float)
+
+        in_position = False
+        entry_price = 0.0
+        highest_high = 0.0
+        trailing_stop = 0.0
+
+        # --- Loop Through Data to Generate Signals ---
+        for i in range(1, len(aligned_data)):
+            current = aligned_data.iloc[i]
+            prev = aligned_data.iloc[i - 1]
+
+            # Weekly trend confirmation: Must be in an uptrend
+            weekly_uptrend = current["ema_fast_weekly"] > current["ema_slow_weekly"]
+
+            # Daily EMA crossover: Yesterday fast EMA below slow EMA, today above
+            ema_crossover = (prev["ema_fast"] < prev["ema_slow"]) and (
+                current["ema_fast"] > current["ema_slow"]
+            )
+
+            # RSI filter: Only enter if RSI is within defined bounds
+            rsi_ok = (current["rsi"] >= self.rsi_lower) and (
+                current["rsi"] <= self.rsi_upper
+            )
+
+            # MACD momentum: Positive histogram indicates upward momentum
+            macd_positive = current["macd_hist"] > 0
+
+            # ----- Entry Condition -----
+            if (
+                (not in_position)
+                and weekly_uptrend
+                and ema_crossover
+                and rsi_ok
+                and macd_positive
+            ):
+                risk_per_share = current["atr"]
+                if risk_per_share <= 0:
+                    continue
+                position_size = (
+                    self.initial_cash * self.risk_per_trade
+                ) / risk_per_share
+                ticker_entries.iloc[i] = True
+                ticker_sizes.iloc[i] = position_size
+                in_position = True
+                entry_price = current["Close"]
+                highest_high = current["High"]
+                trailing_stop = entry_price - 1.5 * current["atr"]
+
+            # ----- Exit Condition -----
+            elif in_position:
+                if current["High"] > highest_high:
+                    highest_high = current["High"]
+                trailing_stop = highest_high - 1.5 * current["atr"]
+                if (
+                    (current["Close"] < trailing_stop)
+                    or (current["macd_hist"] < 0)
+                    or (current["rsi"] >= self.rsi_upper)
+                ):
+                    ticker_exits.iloc[i] = True
+                    exit_prices.iloc[i] = trailing_stop
+                    in_position = False
+
+        ticker_entries = ticker_entries.reindex(date_index, fill_value=False)
+        ticker_exits = ticker_exits.reindex(date_index, fill_value=False)
+        ticker_sizes = ticker_sizes.reindex(date_index, fill_value=0)
+        exit_prices = exit_prices.reindex(date_index)
+        return ticker_entries, ticker_exits, ticker_sizes, exit_prices
+
+
 # -----------------------------
 # Ticker Processing
 # -----------------------------
@@ -506,20 +652,9 @@ def evaluate_strategy(portfolio):
 
 
 def get_strategy():
-    # return De0faultStrategy(
-    #     ema_weekly_fast=EMA_WEEKLY_FAST,
-    #     ema_weekly_slow=EMA_WEEKLY_SLOW,
-    #     ema_daily=EMA_DAILY,
-    #     risk_per_trade=RISK_PER_TRADE,
-    #     initial_cash=INITIAL_CASH,
-    # )
-    return TrendMomentumVolumeATRStrategy(
-        ema_weekly_fast=EMA_WEEKLY_FAST,
-        ema_weekly_slow=EMA_WEEKLY_SLOW,
-        ema_daily=EMA_DAILY,
-        risk_per_trade=RISK_PER_TRADE,
-        initial_cash=INITIAL_CASH,
-    )
+    # return DefaultStrategy()
+    # return TrendMomentumVolumeATRStrategy()
+    return EnhancedRSIMACDStrategy()
 
 
 # -----------------------------
