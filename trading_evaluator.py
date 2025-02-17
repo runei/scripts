@@ -24,14 +24,14 @@ from requests.exceptions import RequestException
 # -----------------------------
 RISK_PER_TRADE = 0.01  # 1% of portfolio per trade
 INITIAL_CASH = 10000
-PROFIT_FACTOR = 4
+PROFIT_FACTOR = 5
 EMA_WEEKLY_FAST = 20
 EMA_WEEKLY_SLOW = 50
 EMA_DAILY = 50
 
 DOWNLOAD_NEW_DATA = False
 CSV_NAME = (
-    "large"  # Downloaded from https://www.nasdaq.com/market-activity/stocks/screener
+    "all"  # Downloaded from https://www.nasdaq.com/market-activity/stocks/screener
 )
 CACHE_DIR = "cache"
 START_DATE = "2015-01-01"
@@ -119,8 +119,11 @@ def download_data_all(interval, session, ticker_list, start=START_DATE, end=END_
         ticker_list[i : i + BATCH_SIZE] for i in range(0, len(ticker_list), BATCH_SIZE)
     ]
     all_data = []
-    for batch in batches:
-        logger.info("Processing batch of %s tickers", len(batch))
+    total_batches = len(batches)
+    for idx, batch in enumerate(batches, start=1):
+        logger.info(
+            "Processing batch %d of %d: %d tickers", idx, total_batches, len(batch)
+        )
         batch_data = download_data_with_retry(batch, interval, session, start, end)
         if batch_data is not None and not batch_data.empty:
             batch_data = flatten_columns(batch_data)
