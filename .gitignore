@@ -1,5 +1,6 @@
 cache/
 strategy_trades.csv
+out
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
