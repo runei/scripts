@@ -2,13 +2,14 @@
 """
 This script downloads historical stock data, processes trading signals based on technical analysis,
 and evaluates a trading strategy using the vectorbt library.
+Now includes a function to run daily after market close to output tickers with entry signals.
 """
 
 import concurrent.futures
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from random import uniform
 from typing import Dict, List, Optional, Tuple
 
@@ -26,15 +27,15 @@ RISK_PER_TRADE = 0.01  # 1% of portfolio per trade
 INITIAL_CASH = 10000
 PROFIT_FACTOR = 3
 
-DOWNLOAD_NEW_DATA = True
-CSV_NAME = "mega"  # e.g., downloaded from https://www.nasdaq.com/market-activity/stocks/screener
-CACHE_DIR = "cache"
-START_DATE = "2015-01-01"
-END_DATE = datetime.today().strftime("%Y-%m-%d")
+DOWNLOAD_NEW_DATA = False
+CSV_NAME = "all"  # e.g., downloaded from https://www.nasdaq.com/market-activity/stocks/screener
+END_DATE = datetime.today().date()
+START_DATE = END_DATE - timedelta(days=2 * 365)
 
+CACHE_DIR = "cache"
 MAX_RETRIES = 3
 REQUEST_DELAY = 1.5
-BATCH_SIZE = 10
+BATCH_SIZE = 20
 
 # Set up basic logging configuration
 logging.basicConfig(
@@ -192,7 +193,7 @@ class TrendMomentumVolumeATRStrategy(BaseStrategy):
 
     def generate_signals(
         self, daily: pd.DataFrame, weekly: pd.DataFrame, date_index: pd.DatetimeIndex
-    ) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    ) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]:
         # Calculate weekly EMAs
         weekly["ema20"] = vbt.MA.run(
             weekly["Close"], window=self.ema_weekly_fast, ewm=True
@@ -223,6 +224,8 @@ class TrendMomentumVolumeATRStrategy(BaseStrategy):
         ticker_exits = pd.Series(False, index=aligned_data.index, dtype=bool)
         ticker_sizes = pd.Series(0.0, index=aligned_data.index, dtype=float)
         exit_prices = pd.Series(np.nan, index=aligned_data.index, dtype=float)
+        profit_targets = pd.Series(np.nan, index=aligned_data.index, dtype=float)
+        stop_losses = pd.Series(np.nan, index=aligned_data.index, dtype=float)
 
         in_position = False
         entry_price = 0.0
@@ -274,9 +277,12 @@ class TrendMomentumVolumeATRStrategy(BaseStrategy):
                 take_profit = (
                     entry_price + 3 * risk_per_share
                 )  # 3:1 reward-to-risk ratio
+                initial_stop_loss = current["High"] - 1.5 * current["atr"]
 
                 ticker_entries.iloc[i] = True
                 ticker_sizes.iloc[i] = position_size
+                profit_targets.iloc[i] = take_profit
+                stop_losses.iloc[i] = initial_stop_loss
                 in_position = True
 
             # Exit logic
@@ -302,80 +308,17 @@ class TrendMomentumVolumeATRStrategy(BaseStrategy):
         ticker_exits = ticker_exits.reindex(date_index, fill_value=False)
         ticker_sizes = ticker_sizes.reindex(date_index, fill_value=0)
         exit_prices = exit_prices.reindex(date_index)
+        profit_targets = profit_targets.reindex(date_index)
+        stop_losses = stop_losses.reindex(date_index)
 
-        return ticker_entries, ticker_exits, ticker_sizes, exit_prices
-
-    def filter_weekly(self) -> List[str]:
-        """
-        Downloads weekly data for tickers in CSV_NAME, filters tickers satisfying weekly conditions,
-        and outputs a CSV with qualifying tickers in the 'out/' folder. Only downloads data from the past 10 years.
-        """
-        from datetime import datetime, timedelta
-
-        start_date = (datetime.today() - timedelta(days=365 * 2)).strftime("%Y-%m-%d")
-
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        os.makedirs("out", exist_ok=True)
-
-        input_csv = os.path.join("input", f"{CSV_NAME}.csv")
-        tickers = load_tickers(input_csv)
-        logger.info(f"Loaded {len(tickers)} tickers from {input_csv}")
-
-        session = get_session()
-        weekly_all = download_data_all("1wk", session, tickers, start=start_date)
-        data = prepare_data_dicts(weekly_all, tickers)
-
-        def ticker_qualifies(ticker: str) -> Optional[str]:
-            if ticker not in data:
-                logger.warning(f"No weekly data available for {ticker}")
-                return None
-            df = data[ticker]
-            if df.empty:
-                logger.warning(f"Empty DataFrame for {ticker}")
-                return None
-
-            try:
-                ema_fast = vbt.MA.run(
-                    df["Close"], window=self.ema_weekly_fast, ewm=True
-                ).ma
-                ema_slow = vbt.MA.run(
-                    df["Close"], window=self.ema_weekly_slow, ewm=True
-                ).ma
-            except Exception as e:
-                logger.error(f"Error calculating EMAs for {ticker}: {e}")
-                return None
-
-            if len(df) < 1 or len(ema_fast) < 1 or len(ema_slow) < 1:
-                logger.warning(f"Insufficient data for {ticker}")
-                return None
-
-            latest_close = df["Close"].iloc[-1]
-            latest_ema_fast = ema_fast.iloc[-1]
-            latest_ema_slow = ema_slow.iloc[-1]
-
-            if (
-                not pd.isna(latest_ema_fast)
-                and not pd.isna(latest_ema_slow)
-                and (latest_close > latest_ema_fast)
-                and (latest_ema_fast > latest_ema_slow)
-            ):
-                return ticker
-            return None
-
-        result_tickers = []
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = {
-                executor.submit(ticker_qualifies, ticker): ticker for ticker in tickers
-            }
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                if result is not None:
-                    result_tickers.append(result)
-
-        output_path = os.path.join("out", "weekly_tickers.csv")
-        pd.DataFrame({"Ticker": result_tickers}).to_csv(output_path, index=False)
-        logger.info(f"Exported {len(result_tickers)} tickers to {output_path}")
-        return result_tickers
+        return (
+            ticker_entries,
+            ticker_exits,
+            ticker_sizes,
+            exit_prices,
+            profit_targets,
+            stop_losses,
+        )
 
 
 # -----------------------------
@@ -388,7 +331,12 @@ def process_ticker(
     weekly_data: Dict[str, pd.DataFrame],
     date_index: pd.DatetimeIndex,
 ) -> Tuple[
-    Optional[pd.Series], Optional[pd.Series], Optional[pd.Series], Optional[pd.Series]
+    Optional[pd.Series],
+    Optional[pd.Series],
+    Optional[pd.Series],
+    Optional[pd.Series],
+    Optional[pd.Series],
+    Optional[pd.Series],
 ]:
     """
     Process a single ticker to generate trading signals using the provided strategy.
@@ -397,14 +345,14 @@ def process_ticker(
     try:
         if ticker not in daily_data or ticker not in weekly_data:
             logger.warning(f"No data available for {ticker}")
-            return None, None, None, None
+            return None, None, None, None, None, None
 
         daily = daily_data[ticker]
         weekly = weekly_data[ticker]
         return strategy.generate_signals(daily, weekly, date_index)
     except Exception as error:
         logger.error(f"Error processing {ticker}: {error}", exc_info=True)
-        return None, None, None, None
+        return None, None, None, None, None, None
 
 
 # -----------------------------
@@ -509,7 +457,7 @@ def prepare_data_dicts(
 
 
 # -----------------------------
-# Main Execution
+# Main Execution (Backtest)
 # -----------------------------
 def main():
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -543,7 +491,9 @@ def main():
     exits = pd.DataFrame(False, index=date_index, columns=tickers, dtype=bool)
     sizes = pd.DataFrame(0.0, index=date_index, columns=tickers, dtype=float)
 
-    results: Dict[str, Tuple[pd.Series, pd.Series, pd.Series, pd.Series]] = {}
+    results: Dict[
+        str, Tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series]
+    ] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         future_to_ticker = {
             executor.submit(
@@ -558,12 +508,26 @@ def main():
         }
         for future in concurrent.futures.as_completed(future_to_ticker):
             ticker_item = future_to_ticker[future]
-            t_entries, t_exits, t_sizes, t_exit_prices = future.result()
+            (
+                t_entries,
+                t_exits,
+                t_sizes,
+                t_exit_prices,
+                t_profit_targets,
+                t_stop_losses,
+            ) = future.result()
             if t_entries is not None:
-                results[ticker_item] = (t_entries, t_exits, t_sizes, t_exit_prices)
+                results[ticker_item] = (
+                    t_entries,
+                    t_exits,
+                    t_sizes,
+                    t_exit_prices,
+                    t_profit_targets,
+                    t_stop_losses,
+                )
 
     # Populate signal DataFrames from per-ticker results
-    for ticker_item, (t_entries, t_exits, t_sizes, _) in results.items():
+    for ticker_item, (t_entries, t_exits, t_sizes, _, _, _) in results.items():
         entries[ticker_item] = t_entries
         exits[ticker_item] = t_exits
         sizes[ticker_item] = t_sizes
@@ -577,7 +541,7 @@ def main():
             close_prices[ticker_item] = np.nan
 
     # Override close prices on exit dates with custom exit prices from our strategy
-    for ticker_item, (_, t_exits, _, t_exit_prices) in results.items():
+    for ticker_item, (_, t_exits, _, t_exit_prices, _, _) in results.items():
         exit_dates = t_exit_prices[t_exits].index
         for date in exit_dates:
             if not pd.isna(t_exit_prices.loc[date]):
@@ -602,14 +566,81 @@ def main():
 
     # Export trade records to CSV
     trades_df = portfolio.trades.records_readable
-    trades_df.to_csv("strategy_trades.csv", index=False)
+    trades_df.to_csv("out/strategy_trades.csv", index=False)
     logger.info(
         "Strategy evaluation complete. Trades exported to 'strategy_trades.csv'."
     )
 
 
+# -----------------------------
+# Daily Entry Signal Function
+# -----------------------------
+def run_daily_entry_signals() -> List[Dict]:
+    """
+    Run the strategy after market close to obtain tickers with an entry signal on that day.
+    Returns a list of dictionaries with ticker, entry price, position size, profit target, and stop loss.
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    input_csv = os.path.join("input", f"{CSV_NAME}.csv")
+    tickers = load_tickers(input_csv)
+    logger.info(f"Loaded {len(tickers)} tickers from {input_csv}")
+
+    session = get_session()
+    # Download latest daily and weekly data
+    daily_all = download_data_all("1d", session, tickers)
+    weekly_all = download_data_all("1wk", session, tickers)
+
+    daily_data_dict = prepare_data_dicts(daily_all, tickers)
+    weekly_data_dict = prepare_data_dicts(weekly_all, tickers)
+
+    date_index = pd.date_range(start=START_DATE, end=END_DATE)
+    strategy = get_strategy()
+
+    entry_signals = []
+
+    for ticker in tickers:
+        t_entries, t_exits, t_sizes, t_exit_prices, t_profit_targets, t_stop_losses = (
+            process_ticker(
+                ticker, strategy, daily_data_dict, weekly_data_dict, date_index
+            )
+        )
+        if t_entries is not None and not t_entries.empty and t_entries.iloc[-1]:
+            # An entry signal was generated on the last day
+            try:
+                entry_price = daily_data_dict[ticker].loc[date_index[-1], "Close"]
+            except KeyError:
+                entry_price = np.nan
+            position_size = t_sizes.loc[date_index[-1]]
+            profit_target = t_profit_targets.loc[date_index[-1]]
+            stop_loss = t_stop_losses.loc[date_index[-1]]
+            entry_signals.append(
+                {
+                    "ticker": ticker,
+                    "entry_price": entry_price,
+                    "position_size": position_size,
+                    "profit_target": profit_target,
+                    "stop_loss": stop_loss,
+                }
+            )
+
+    return entry_signals
+
+
+def search_entry_signals():
+    signals = run_daily_entry_signals()
+    if signals:
+        print("Today's Entry Signals:")
+        for signal in signals:
+            print(signal)
+    else:
+        print("No entry signals for today.")
+
+
 if __name__ == "__main__":
-    # main()
-    # Optionally, run the weekly filter if desired:
-    strategy = TrendMomentumVolumeATRStrategy()
-    strategy.filter_weekly()
+    # Uncomment one of the following lines depending on the desired execution:
+
+    # For backtesting the strategy:
+    main()
+
+    # For running daily entry signal check after market close:
+    # search_entry_signals()
