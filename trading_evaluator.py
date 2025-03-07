@@ -5,6 +5,7 @@ and evaluates a trading strategy using the vectorbt library.
 Now includes a function to run daily after market close to output tickers with entry signals.
 """
 
+import argparse
 import concurrent.futures
 import logging
 import os
@@ -24,13 +25,13 @@ from requests.exceptions import RequestException
 # Configuration
 # -----------------------------
 RISK_PER_TRADE = 0.01  # 1% of portfolio per trade
-INITIAL_CASH = 10000
+INITIAL_CASH = 3000
 PROFIT_FACTOR = 3
 
 DOWNLOAD_NEW_DATA = False
 CSV_NAME = "all"  # e.g., downloaded from https://www.nasdaq.com/market-activity/stocks/screener
-END_DATE = datetime.today().date()
-START_DATE = END_DATE - timedelta(days=2 * 365)
+END_DATE = datetime.today().date() - timedelta(days=1)
+START_DATE = END_DATE - timedelta(days=1.5 * 365)
 
 CACHE_DIR = "cache"
 MAX_RETRIES = 3
@@ -79,7 +80,6 @@ def flatten_columns(df: Optional[pd.DataFrame]) -> pd.DataFrame:
         len(df.columns) > 0 and isinstance(df.columns[0], tuple)
     ):
         df.columns = ["_".join(map(str, col)).strip() for col in df.columns.values]
-
     return df
 
 
@@ -123,14 +123,13 @@ def download_data_all(
     interval: str,
     session: requests.Session,
     ticker_list: List[str],
-    start: str = START_DATE,
-    end: str = END_DATE,
+    start: str = str(START_DATE),
+    end: str = str(END_DATE),
 ) -> pd.DataFrame:
     """
     Download data for all tickers in batches with rate limiting, using a caching mechanism.
     """
-    filename = os.path.join(CACHE_DIR, f"{CSV_NAME}_{interval}.csv")
-
+    filename = os.path.join(CACHE_DIR, f"{CSV_NAME}{interval}.csv")
     batches = [
         ticker_list[i : i + BATCH_SIZE] for i in range(0, len(ticker_list), BATCH_SIZE)
     ]
@@ -623,6 +622,8 @@ def run_daily_entry_signals() -> List[Dict]:
                 }
             )
 
+    df = pd.DataFrame(entry_signals)
+    df.to_csv("out/entries.csv", index=False)
     return entry_signals
 
 
@@ -637,10 +638,18 @@ def search_entry_signals():
 
 
 if __name__ == "__main__":
-    # Uncomment one of the following lines depending on the desired execution:
+    parser = argparse.ArgumentParser(
+        description="Run trading strategy or entry signal search."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["test", "entries"],
+        required=True,
+        help="Choose between backtesting the strategy or getting entry signals.",
+    )
+    args = parser.parse_args()
 
-    # For backtesting the strategy:
-    main()
-
-    # For running daily entry signal check after market close:
-    # search_entry_signals()
+    if args.mode == "test":
+        main()
+    elif args.mode == "entries":
+        run_daily_entry_signals()
