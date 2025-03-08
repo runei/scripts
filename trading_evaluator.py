@@ -264,19 +264,19 @@ class TrendMomentumVolumeATRStrategy(BaseStrategy):
                 and rsi_ok
                 and volume_ok
             ):
-                risk_per_share = 2 * current["atr"]
-                if risk_per_share == 0:
+                initial_atr = current["atr"]
+                entry_price = current["Close"]
+                initial_stop_loss = current["High"] - 1.5 * initial_atr
+                risk_per_share = entry_price - initial_stop_loss
+                if risk_per_share <= 0:
                     continue
                 position_size = (
                     self.initial_cash * self.risk_per_trade
                 ) / risk_per_share
-                entry_price = current["Close"]
-                initial_atr = current["atr"]
                 highest_high = current["High"]
                 take_profit = (
                     entry_price + 3 * risk_per_share
                 )  # 3:1 reward-to-risk ratio
-                initial_stop_loss = current["High"] - 1.5 * current["atr"]
 
                 ticker_entries.iloc[i] = True
                 ticker_sizes.iloc[i] = position_size
@@ -586,8 +586,15 @@ def run_daily_entry_signals() -> List[Dict]:
 
     session = get_session()
     # Download latest daily and weekly data
-    daily_all = download_data_all("1d", session, tickers)
-    weekly_all = download_data_all("1wk", session, tickers)
+    if DOWNLOAD_NEW_DATA:
+        daily_all = download_data_all("1d", session, tickers)
+        weekly_all = download_data_all("1wk", session, tickers)
+    else:
+        logger.info("Loading cached combined data")
+        daily_path = os.path.join(CACHE_DIR, f"{CSV_NAME}1d.csv")
+        weekly_path = os.path.join(CACHE_DIR, f"{CSV_NAME}1wk.csv")
+        daily_all = pd.read_csv(daily_path, index_col="Date", parse_dates=True)
+        weekly_all = pd.read_csv(weekly_path, index_col="Date", parse_dates=True)
 
     daily_data_dict = prepare_data_dicts(daily_all, tickers)
     weekly_data_dict = prepare_data_dicts(weekly_all, tickers)
@@ -606,12 +613,12 @@ def run_daily_entry_signals() -> List[Dict]:
         if t_entries is not None and not t_entries.empty and t_entries.iloc[-1]:
             # An entry signal was generated on the last day
             try:
-                entry_price = daily_data_dict[ticker].loc[date_index[-1], "Close"]
+                entry_price = daily_data_dict[ticker]["Close"].iloc[-1]
             except KeyError:
                 entry_price = np.nan
-            position_size = t_sizes.loc[date_index[-1]]
-            profit_target = t_profit_targets.loc[date_index[-1]]
-            stop_loss = t_stop_losses.loc[date_index[-1]]
+            position_size = t_sizes.iloc[-1]
+            profit_target = t_profit_targets.iloc[-1]
+            stop_loss = t_stop_losses.iloc[-1]
             entry_signals.append(
                 {
                     "ticker": ticker,
@@ -623,6 +630,7 @@ def run_daily_entry_signals() -> List[Dict]:
             )
 
     df = pd.DataFrame(entry_signals)
+    df = df.round(2)
     df.to_csv("out/entries.csv", index=False)
     return entry_signals
 
