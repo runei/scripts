@@ -253,7 +253,7 @@ class TrendMomentumVolumeATRStrategy(BaseStrategy):
             # Indicator conditions
             above_ema50 = current["Close"] > current["ema50"]
             rsi_ok = 50 < current["rsi"] < 70  # avoid overbought conditions
-            volume_ok = current["Volume"] > current["volume_ma"]
+            volume_ok = current["Volume"] > current["volume_ma"] > 1000000
 
             # Entry logic
             if (
@@ -266,14 +266,14 @@ class TrendMomentumVolumeATRStrategy(BaseStrategy):
             ):
                 initial_atr = current["atr"]
                 entry_price = current["Close"]
-                initial_stop_loss = current["High"] - 1.5 * initial_atr
+                initial_stop_loss = entry_price - 1.5 * initial_atr
                 risk_per_share = entry_price - initial_stop_loss
                 if risk_per_share <= 0:
                     continue
                 position_size = (
                     self.initial_cash * self.risk_per_trade
                 ) / risk_per_share
-                highest_high = current["High"]
+                highest_high = entry_price
                 take_profit = (
                     entry_price + 3 * risk_per_share
                 )  # 3:1 reward-to-risk ratio
@@ -283,6 +283,7 @@ class TrendMomentumVolumeATRStrategy(BaseStrategy):
                 profit_targets.iloc[i] = take_profit
                 stop_losses.iloc[i] = initial_stop_loss
                 in_position = True
+                continue
 
             # Exit logic
             if in_position:
